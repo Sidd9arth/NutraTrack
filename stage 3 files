@@ -1,0 +1,535 @@
+abstract final class SupabaseConstants {
+  // ---------------------------------------------------------------------------
+  // Connection — injected via --dart-define at build time. Never hardcode.
+  // ---------------------------------------------------------------------------
+  static const supabaseUrl = String.fromEnvironment('SUPABASE_URL');
+  static const supabaseAnonKey = String.fromEnvironment('SUPABASE_ANON_KEY');
+
+  // ---------------------------------------------------------------------------
+  // Table names
+  // ---------------------------------------------------------------------------
+  static const tableProfiles = 'profiles';
+  static const tableFoods = 'foods';
+  static const tableFoodServingAlternatives = 'food_serving_alternatives';
+  static const tableFoodLogs = 'food_logs';
+  static const tableWeightLogs = 'weight_logs';
+  static const tableGoals = 'goals';
+  static const tableExpenditureHistory = 'expenditure_history';
+  static const tableWeeklyCheckins = 'weekly_checkins';
+  static const tableFavorites = 'favorites';
+  static const tableRecentFoods = 'recent_foods';
+
+  // ---------------------------------------------------------------------------
+  // RPC function names
+  // ---------------------------------------------------------------------------
+  static const rpcGetDailyNutritionTotals = 'get_daily_nutrition_totals';
+  static const rpcGetDailyNutritionByMeal = 'get_daily_nutrition_by_meal';
+  static const rpcGetWeightLogWindow = 'get_weight_log_window';
+  static const rpcGetWeeklyExpenditureInputs = 'get_weekly_expenditure_inputs';
+  static const rpcSearchFoods = 'search_foods';
+  static const rpcGetRecentFoods = 'get_recent_foods_with_details';
+  static const rpcGetFavoriteFoods = 'get_favorite_foods_with_details';
+  static const rpcToggleFavorite = 'toggle_favorite';
+  static const rpcGetDashboardSummary = 'get_dashboard_summary';
+  static const rpcGetLoggingStreak = 'get_logging_streak';
+  static const rpcGetCheckInData = 'get_check_in_data';
+  static const rpcUpsertRecentFood = 'upsert_recent_food';
+}
+abstract final class AppConstants {
+  // ---------------------------------------------------------------------------
+  // EWMA (Exponentially Weighted Moving Average) — weight trend
+  // ---------------------------------------------------------------------------
+  /// Smoothing factor λ. Higher = more responsive, lower = smoother.
+  static const double ewmaLambda = 0.1;
+
+  /// Minimum number of weight data points before trend is considered reliable.
+  static const int ewmaMinDataPoints = 7;
+
+  /// Number of days to fetch for trend calculation window.
+  static const int trendWindowDays = 42;
+
+  // ---------------------------------------------------------------------------
+  // Expenditure estimation
+  // ---------------------------------------------------------------------------
+  /// Kcal equivalent of 1 kg of body fat (used for deficit/surplus math).
+  static const double kcalPerKg = 7700.0;
+
+  /// Minimum days with food logs in a week to compute adaptive TDEE.
+  static const int minLoggedDaysForAdaptiveTdee = 4;
+
+  // ---------------------------------------------------------------------------
+  // Goal safety limits
+  // ---------------------------------------------------------------------------
+  /// Maximum safe weekly weight loss rate (kg).
+  static const double maxWeeklyLossKg = 1.0;
+
+  /// Maximum safe weekly weight gain rate (kg).
+  static const double maxWeeklyGainKg = 0.5;
+
+  // ---------------------------------------------------------------------------
+  // UI / UX
+  // ---------------------------------------------------------------------------
+  /// Recent foods list maximum length.
+  static const int recentFoodsLimit = 20;
+
+  /// Food search results page size.
+  static const int foodSearchPageSize = 25;
+
+  /// Analytics maximum date range (days).
+  static const int analyticsMaxDays = 365;
+
+  // ---------------------------------------------------------------------------
+  // Macro floors (used by MacroService)
+  // ---------------------------------------------------------------------------
+  /// Minimum protein per kg of bodyweight (g/kg).
+  static const double proteinFloorGPerKg = 1.6;
+
+  /// Target protein per kg of bodyweight (g/kg).
+  static const double proteinTargetGPerKg = 2.0;
+
+  /// Minimum fat as fraction of total calories.
+  static const double fatMinFraction = 0.20;
+}
+/// Base sealed class for all application exceptions.
+/// Every layer throws a subclass of this; the UI maps them to messages.
+sealed class AppException implements Exception {
+  const AppException(this.message, {this.code, this.originalError});
+
+  final String message;
+  final String? code;
+  final Object? originalError;
+
+  @override
+  String toString() => 'AppException($code): $message';
+}
+
+// ---------------------------------------------------------------------------
+// Network / Supabase
+// ---------------------------------------------------------------------------
+
+/// Wraps PostgREST, network, and Supabase client errors.
+final class NetworkException extends AppException {
+  const NetworkException(
+    super.message, {
+    super.code,
+    super.originalError,
+  });
+}
+
+/// Thrown when a required database record is not found.
+final class NotFoundException extends AppException {
+  const NotFoundException(super.message, {super.code, super.originalError});
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+/// Wraps Supabase auth errors (wrong password, email taken, etc.).
+final class AuthException extends AppException {
+  const AuthException(super.message, {super.code, super.originalError});
+}
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+/// Thrown when domain-level validation fails before hitting Supabase.
+final class ValidationException extends AppException {
+  const ValidationException(super.message, {super.code, super.originalError});
+}
+
+// ---------------------------------------------------------------------------
+// Unexpected
+// ---------------------------------------------------------------------------
+
+/// Catch-all for errors that don't fit a known category.
+final class UnknownException extends AppException {
+  const UnknownException(super.message, {super.code, super.originalError});
+}
+
+// ---------------------------------------------------------------------------
+// Extension: user-facing message
+// ---------------------------------------------------------------------------
+
+extension AppExceptionMessage on AppException {
+  /// Returns a short, user-friendly string suitable for displaying in the UI.
+  String get userMessage => switch (this) {
+        AuthException e => _authMessage(e),
+        NetworkException _ =>
+          'A network error occurred. Please check your connection.',
+        NotFoundException _ => 'The requested item could not be found.',
+        ValidationException e => e.message,
+        UnknownException _ => 'Something went wrong. Please try again.',
+      };
+
+  String _authMessage(AuthException e) {
+    final code = e.code ?? '';
+    return switch (code) {
+      'invalid_credentials' => 'Incorrect email or password.',
+      'email_already_in_use' => 'An account with that email already exists.',
+      'weak_password' => 'Password must be at least 8 characters.',
+      'user_not_found' => 'No account found with that email.',
+      _ => e.message,
+    };
+  }
+}import 'package:supabase_flutter/supabase_flutter.dart';
+
+import 'app_exception.dart';
+
+/// Converts raw Supabase, PostgrestException, and AuthException errors
+/// into typed [AppException] subclasses.
+///
+/// Usage:
+/// ```dart
+/// try {
+///   await supabase.from('profiles').select().single();
+/// } catch (e, st) {
+///   throw ExceptionHandler.handle(e, st);
+/// }
+/// ```
+abstract final class ExceptionHandler {
+  static AppException handle(Object error, [StackTrace? stackTrace]) {
+    return switch (error) {
+      // Supabase auth error
+      AuthException e => _handleAuthException(e),
+
+      // PostgREST / database error
+      PostgrestException e => _handlePostgrestException(e),
+
+      // Already typed — pass through
+      AppException e => e,
+
+      // Fallback
+      _ => UnknownException(
+          error.toString(),
+          originalError: error,
+        ),
+    };
+  }
+
+  static AuthException _handleAuthException(AuthException e) {
+    return AuthException(
+      e.message,
+      code: e.statusCode,
+      originalError: e,
+    );
+  }
+
+  static AppException _handlePostgrestException(PostgrestException e) {
+    // 404 / PGRST116 = no rows returned from .single()
+    if (e.code == 'PGRST116' || e.details?.contains('0 rows') == true) {
+      return NotFoundException(
+        'Record not found.',
+        code: e.code,
+        originalError: e,
+      );
+    }
+
+    return NetworkException(
+      e.message,
+      code: e.code,
+      originalError: e,
+    );
+  }
+}extension DateTimeExtensions on DateTime {
+  /// Returns an ISO 8601 date-only string: "2024-03-15"
+  String toIso8601DateString() =>
+      '${year.toString().padLeft(4, '0')}'
+      '-${month.toString().padLeft(2, '0')}'
+      '-${day.toString().padLeft(2, '0')}';
+
+  /// Returns the Monday of the ISO week this date belongs to.
+  /// Matches PostgreSQL's date_trunc('week', ...) behaviour.
+  DateTime get startOfWeek {
+    final daysFromMonday = weekday - DateTime.monday;
+    return subtract(Duration(days: daysFromMonday))
+        .copyWith(hour: 0, minute: 0, second: 0, millisecond: 0, microsecond: 0);
+  }
+
+  /// Returns the Sunday of the ISO week this date belongs to.
+  DateTime get endOfWeek => startOfWeek.add(const Duration(days: 6));
+
+  /// Returns the start of the day (midnight).
+  DateTime get startOfDay =>
+      copyWith(hour: 0, minute: 0, second: 0, millisecond: 0, microsecond: 0);
+
+  /// Returns the end of the day (23:59:59.999).
+  DateTime get endOfDay =>
+      copyWith(hour: 23, minute: 59, second: 59, millisecond: 999, microsecond: 0);
+
+  /// True if this date is the same calendar day as [other].
+  bool isSameDay(DateTime other) =>
+      year == other.year && month == other.month && day == other.day;
+
+  /// True if this date is today.
+  bool get isToday => isSameDay(DateTime.now());
+
+  /// True if this date is yesterday.
+  bool get isYesterday => isSameDay(DateTime.now().subtract(const Duration(days: 1)));
+
+  /// Returns a human-readable relative label: "Today", "Yesterday", or the date string.
+  String get relativeLabel {
+    if (isToday) return 'Today';
+    if (isYesterday) return 'Yesterday';
+    return toIso8601DateString();
+  }
+}
+
+extension NullableDateTimeExtensions on DateTime? {
+  bool get isNullOrPast {
+    if (this == null) return true;
+    return this!.isBefore(DateTime.now());
+  }
+}extension DoubleExtensions on double {
+  /// Rounds to [decimals] decimal places.
+  double roundTo(int decimals) {
+    final factor = _pow10(decimals);
+    return (this * factor).round() / factor;
+  }
+
+  /// Converts kg to lbs.
+  double get kgToLbs => this * 2.20462;
+
+  /// Converts lbs to kg.
+  double get lbsToKg => this / 2.20462;
+
+  /// Converts cm to inches.
+  double get cmToInches => this / 2.54;
+
+  /// Converts inches to cm.
+  double get inchesToCm => this * 2.54;
+
+  /// Returns a display string with [decimals] decimal places and unit.
+  String toWeightString({bool imperial = false, int decimals = 1}) {
+    final value = imperial ? kgToLbs : this;
+    final unit = imperial ? 'lbs' : 'kg';
+    return '${value.roundTo(decimals)} $unit';
+  }
+
+  /// Returns a display string for calories, rounded to the nearest integer.
+  String get toKcalString => '${toInt()} kcal';
+
+  /// Returns a display string for grams, with 1 decimal place.
+  String get toGramString => '${roundTo(1)}g';
+
+  /// Clamps and returns a 0–1 fraction, safe for progress indicators.
+  double get toFraction => clamp(0.0, 1.0);
+
+  double _pow10(int n) {
+    var result = 1.0;
+    for (var i = 0; i < n; i++) {
+      result *= 10;
+    }
+    return result;
+  }
+}
+
+extension NullableDoubleExtensions on double? {
+  double get orZero => this ?? 0.0;
+}extension DoubleExtensions on double {
+  /// Rounds to [decimals] decimal places.
+  double roundTo(int decimals) {
+    final factor = _pow10(decimals);
+    return (this * factor).round() / factor;
+  }
+
+  /// Converts kg to lbs.
+  double get kgToLbs => this * 2.20462;
+
+  /// Converts lbs to kg.
+  double get lbsToKg => this / 2.20462;
+
+  /// Converts cm to inches.
+  double get cmToInches => this / 2.54;
+
+  /// Converts inches to cm.
+  double get inchesToCm => this * 2.54;
+
+  /// Returns a display string with [decimals] decimal places and unit.
+  String toWeightString({bool imperial = false, int decimals = 1}) {
+    final value = imperial ? kgToLbs : this;
+    final unit = imperial ? 'lbs' : 'kg';
+    return '${value.roundTo(decimals)} $unit';
+  }
+
+  /// Returns a display string for calories, rounded to the nearest integer.
+  String get toKcalString => '${toInt()} kcal';
+
+  /// Returns a display string for grams, with 1 decimal place.
+  String get toGramString => '${roundTo(1)}g';
+
+  /// Clamps and returns a 0–1 fraction, safe for progress indicators.
+  double get toFraction => clamp(0.0, 1.0);
+
+  double _pow10(int n) {
+    var result = 1.0;
+    for (var i = 0; i < n; i++) {
+      result *= 10;
+    }
+    return result;
+  }
+}
+
+extension NullableDoubleExtensions on double? {
+  double get orZero => this ?? 0.0;
+}extension DoubleExtensions on double {
+  /// Rounds to [decimals] decimal places.
+  double roundTo(int decimals) {
+    final factor = _pow10(decimals);
+    return (this * factor).round() / factor;
+  }
+
+  /// Converts kg to lbs.
+  double get kgToLbs => this * 2.20462;
+
+  /// Converts lbs to kg.
+  double get lbsToKg => this / 2.20462;
+
+  /// Converts cm to inches.
+  double get cmToInches => this / 2.54;
+
+  /// Converts inches to cm.
+  double get inchesToCm => this * 2.54;
+
+  /// Returns a display string with [decimals] decimal places and unit.
+  String toWeightString({bool imperial = false, int decimals = 1}) {
+    final value = imperial ? kgToLbs : this;
+    final unit = imperial ? 'lbs' : 'kg';
+    return '${value.roundTo(decimals)} $unit';
+  }
+
+  /// Returns a display string for calories, rounded to the nearest integer.
+  String get toKcalString => '${toInt()} kcal';
+
+  /// Returns a display string for grams, with 1 decimal place.
+  String get toGramString => '${roundTo(1)}g';
+
+  /// Clamps and returns a 0–1 fraction, safe for progress indicators.
+  double get toFraction => clamp(0.0, 1.0);
+
+  double _pow10(int n) {
+    var result = 1.0;
+    for (var i = 0; i < n; i++) {
+      result *= 10;
+    }
+    return result;
+  }
+}
+
+extension NullableDoubleExtensions on double? {
+  double get orZero => this ?? 0.0;
+}extension StringExtensions on String {
+  /// Returns the string with the first character uppercased.
+  String get capitalized {
+    if (isEmpty) return this;
+    return '${this[0].toUpperCase()}${substring(1)}';
+  }
+
+  /// Returns true if the string is a valid email address.
+  bool get isValidEmail {
+    return RegExp(
+      r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$',
+    ).hasMatch(trim());
+  }
+
+  /// Returns true if the string, trimmed, has no characters.
+  bool get isBlank => trim().isEmpty;
+
+  /// Returns null if the string is blank, otherwise the trimmed string.
+  String? get nullIfBlank => isBlank ? null : trim();
+}
+
+extension NullableStringExtensions on String? {
+  bool get isNullOrBlank => this == null || this!.trim().isEmpty;
+
+  String get orEmpty => this ?? '';
+}import 'string_extensions.dart' show StringExtensions;
+
+/// Pure validation functions. Return an error string if invalid, null if valid.
+/// Compatible with Flutter's [FormField.validator] signature.
+abstract final class Validators {
+  // ---------------------------------------------------------------------------
+  // Auth
+  // ---------------------------------------------------------------------------
+
+  static String? email(String? value) {
+    if (value == null || value.trim().isEmpty) return 'Email is required.';
+    if (!value.isValidEmail) return 'Please enter a valid email address.';
+    return null;
+  }
+
+  static String? password(String? value) {
+    if (value == null || value.isEmpty) return 'Password is required.';
+    if (value.length < 8) return 'Password must be at least 8 characters.';
+    return null;
+  }
+
+  static String? confirmPassword(String? value, String? original) {
+    final base = password(value);
+    if (base != null) return base;
+    if (value != original) return 'Passwords do not match.';
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Profile
+  // ---------------------------------------------------------------------------
+
+  static String? displayName(String? value) {
+    if (value == null || value.trim().isEmpty) return 'Name is required.';
+    if (value.trim().length < 2) return 'Name must be at least 2 characters.';
+    return null;
+  }
+
+  static String? heightCm(String? value) {
+    if (value == null || value.trim().isEmpty) return null; // optional
+    final parsed = double.tryParse(value.trim());
+    if (parsed == null) return 'Please enter a valid height.';
+    if (parsed < 50 || parsed > 280) return 'Height must be between 50 and 280 cm.';
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Nutrition
+  // ---------------------------------------------------------------------------
+
+  static String? servingSize(String? value) {
+    if (value == null || value.trim().isEmpty) return 'Serving size is required.';
+    final parsed = double.tryParse(value.trim());
+    if (parsed == null) return 'Please enter a number.';
+    if (parsed <= 0) return 'Serving size must be greater than 0.';
+    return null;
+  }
+
+  static String? calories(String? value) {
+    if (value == null || value.trim().isEmpty) return 'Calories are required.';
+    final parsed = double.tryParse(value.trim());
+    if (parsed == null) return 'Please enter a number.';
+    if (parsed < 0) return 'Calories cannot be negative.';
+    return null;
+  }
+
+  static String? macroGrams(String? value, {bool required = false}) {
+    if (value == null || value.trim().isEmpty) {
+      return required ? 'This field is required.' : null;
+    }
+    final parsed = double.tryParse(value.trim());
+    if (parsed == null) return 'Please enter a number.';
+    if (parsed < 0) return 'Value cannot be negative.';
+    return null;
+  }
+
+  static String? weight(String? value) {
+    if (value == null || value.trim().isEmpty) return 'Weight is required.';
+    final parsed = double.tryParse(value.trim());
+    if (parsed == null) return 'Please enter a number.';
+    if (parsed <= 0 || parsed > 999) return 'Please enter a realistic weight.';
+    return null;
+  }
+
+  static String? required(String? value, {String fieldName = 'This field'}) {
+    if (value == null || value.trim().isEmpty) return '$fieldName is required.';
+    return null;
+  }
+}
