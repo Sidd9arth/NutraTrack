@@ -1,0 +1,1601 @@
+# NutraTrack — Part 2: Database, Supabase & Backend
+
+> Complete SQL schema · Migrations · RLS policies · RPC functions · Seed data  
+> Version 1.0 — Online-first, single user
+
+---
+
+## Table of Contents
+
+1. [Supabase Project Setup](#1-supabase-project-setup)
+2. [Migration 001 — Extensions & Helpers](#2-migration-001--extensions--helpers)
+3. [Migration 002 — Core Tables](#3-migration-002--core-tables)
+4. [Migration 003 — Indexes](#4-migration-003--indexes)
+5. [Migration 004 — Row Level Security](#5-migration-004--row-level-security)
+6. [Migration 005 — Triggers & Automation](#6-migration-005--triggers--automation)
+7. [Migration 006 — RPC Functions](#7-migration-006--rpc-functions)
+8. [Migration 007 — Seed Data](#8-migration-007--seed-data)
+9. [Supabase Storage Setup](#9-supabase-storage-setup)
+10. [Auth Configuration](#10-auth-configuration)
+11. [Environment Variables](#11-environment-variables)
+12. [Database Design Decisions](#12-database-design-decisions)
+
+---
+
+## 1. Supabase Project Setup
+
+### 1.1 Project Configuration
+
+Create a new Supabase project. After creation, the following must be configured manually in the Supabase dashboard before running migrations:
+
+**Authentication → Providers:**
+- Email: enabled, confirm email: disabled (personal app, no need for verification flow)
+- Google: optional, configure OAuth credentials
+- Apple: optional, configure Sign in with Apple
+
+**Authentication → Email Templates:**
+- Not critical for personal use. Leave defaults.
+
+**API Settings:**
+- JWT expiry: 3600 (1 hour) — Supabase Flutter SDK handles refresh automatically
+- Enable `pgcrypto` extension: yes (needed for `gen_random_uuid()`)
+
+**Database → Extensions (enable via dashboard or migration):**
+```sql
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";   -- fuzzy food search
+```
+
+### 1.2 Migration File Naming Convention
+
+All migrations live in `supabase/migrations/`. Supabase CLI applies them in filename order.
+
+```
+supabase/
+├── migrations/
+│   ├── 20240101000001_extensions.sql
+│   ├── 20240101000002_core_tables.sql
+│   ├── 20240101000003_indexes.sql
+│   ├── 20240101000004_rls.sql
+│   ├── 20240101000005_triggers.sql
+│   ├── 20240101000006_rpc_functions.sql
+│   └── 20240101000007_seed_data.sql
+├── seed.sql                              # Symlink or copy of 000007
+└── config.toml
+```
+
+---
+
+## 2. Migration 001 — Extensions & Helpers
+
+```sql
+-- supabase/migrations/20240101000001_extensions.sql
+
+-- ============================================================
+-- EXTENSIONS
+-- ============================================================
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+
+-- ============================================================
+-- HELPER: automatically update updated_at on row change
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION trigger_set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================
+-- HELPER: automatically create a profile row when a new
+-- auth.users row is inserted (handles sign-up)
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION handle_new_user()
+RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO public.profiles (id, display_name)
+  VALUES (
+    NEW.id,
+    COALESCE(NEW.raw_user_meta_data->>'display_name', split_part(NEW.email, '@', 1))
+  )
+  ON CONFLICT (id) DO NOTHING;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+```
+
+---
+
+## 3. Migration 002 — Core Tables
+
+```sql
+-- supabase/migrations/20240101000002_core_tables.sql
+
+-- ============================================================
+-- PROFILES
+-- Extended user data. One row per auth.users row.
+-- ============================================================
+
+CREATE TABLE public.profiles (
+  id               UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  display_name     TEXT,
+  sex              TEXT CHECK (sex IN ('male', 'female', 'other')),
+  date_of_birth    DATE,
+
+  -- Physical stats (used in Harris-Benedict BMR fallback)
+  height_cm        NUMERIC(5,1) CHECK (height_cm > 0 AND height_cm < 300),
+  activity_level   TEXT CHECK (
+    activity_level IN (
+      'sedentary',
+      'lightly_active',
+      'moderately_active',
+      'very_active',
+      'extra_active'
+    )
+  ),
+
+  -- Preferences (synced across devices via this table)
+  unit_system      TEXT NOT NULL DEFAULT 'metric' CHECK (unit_system IN ('metric', 'imperial')),
+  timezone         TEXT NOT NULL DEFAULT 'UTC',
+
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.profiles IS
+  'One row per authenticated user. Extended profile beyond what auth.users stores.';
+
+COMMENT ON COLUMN public.profiles.unit_system IS
+  'Stored here so unit preference syncs across devices automatically.';
+
+COMMENT ON COLUMN public.profiles.timezone IS
+  'IANA timezone string e.g. America/New_York. Used to interpret log_date correctly across device timezones.';
+
+-- ============================================================
+-- FOODS
+-- Shared food database (user_id IS NULL = global/admin food)
+-- plus user-created custom foods (user_id = auth.uid())
+-- ============================================================
+
+CREATE TABLE public.foods (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+  -- NULL means global/shared food visible to all users.
+  -- Non-null means private custom food owned by that user.
+  user_id          UUID REFERENCES public.profiles(id) ON DELETE CASCADE,
+
+  name             TEXT NOT NULL,
+  brand            TEXT,
+  barcode          TEXT,                     -- EAN-13, UPC-A etc. Future barcode scan support.
+  serving_size_g   NUMERIC(8,2) NOT NULL CHECK (serving_size_g > 0),
+  serving_label    TEXT NOT NULL DEFAULT '1 serving',   -- e.g. "1 cup", "1 slice"
+
+  -- Per-serving macros (at serving_size_g grams)
+  calories_kcal    NUMERIC(7,2) NOT NULL CHECK (calories_kcal >= 0),
+  protein_g        NUMERIC(7,2) NOT NULL DEFAULT 0 CHECK (protein_g >= 0),
+  carbs_g          NUMERIC(7,2) NOT NULL DEFAULT 0 CHECK (carbs_g >= 0),
+  fat_g            NUMERIC(7,2) NOT NULL DEFAULT 0 CHECK (fat_g >= 0),
+
+  -- Optional micros
+  fiber_g          NUMERIC(7,2) CHECK (fiber_g >= 0),
+  sugar_g          NUMERIC(7,2) CHECK (sugar_g >= 0),
+  sodium_mg        NUMERIC(8,2) CHECK (sodium_mg >= 0),
+
+  -- Provenance
+  is_verified      BOOLEAN NOT NULL DEFAULT FALSE,   -- admin-verified accuracy
+  source           TEXT DEFAULT 'user' CHECK (
+    source IN ('user', 'admin', 'usda', 'openfoodfacts')
+  ),
+
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.foods IS
+  'Food database. Rows with user_id NULL are global. Rows with user_id are private custom foods.';
+
+COMMENT ON COLUMN public.foods.serving_size_g IS
+  'The gram weight of ONE serving_label unit. All macro values are per this serving.';
+
+-- ============================================================
+-- FOOD_SERVING_ALTERNATIVES
+-- Additional named serving sizes for a food.
+-- e.g. "1 cup" = 240g, "1 tablespoon" = 15g
+-- ============================================================
+
+CREATE TABLE public.food_serving_alternatives (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  food_id          UUID NOT NULL REFERENCES public.foods(id) ON DELETE CASCADE,
+  label            TEXT NOT NULL,           -- "1 cup", "1 tbsp", "1 medium"
+  weight_g         NUMERIC(7,2) NOT NULL CHECK (weight_g > 0)
+);
+
+-- ============================================================
+-- FOOD_LOGS
+-- Every food a user logs on a given day.
+-- Macro values are SNAPSHOTTED at log time to prevent
+-- historical data changing when a food item is later edited.
+-- ============================================================
+
+CREATE TABLE public.food_logs (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id          UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  food_id          UUID NOT NULL REFERENCES public.foods(id),
+
+  log_date         DATE NOT NULL,
+  meal_type        TEXT NOT NULL CHECK (
+    meal_type IN ('breakfast', 'lunch', 'dinner', 'snack')
+  ),
+  servings         NUMERIC(6,2) NOT NULL DEFAULT 1 CHECK (servings > 0),
+
+  -- SNAPSHOT: values captured at log time, independent of food table edits
+  serving_size_g   NUMERIC(8,2) NOT NULL,
+  calories_kcal    NUMERIC(7,2) NOT NULL,
+  protein_g        NUMERIC(7,2) NOT NULL,
+  carbs_g          NUMERIC(7,2) NOT NULL,
+  fat_g            NUMERIC(7,2) NOT NULL,
+  fiber_g          NUMERIC(7,2),
+  sugar_g          NUMERIC(7,2),
+  sodium_mg        NUMERIC(8,2),
+
+  notes            TEXT,
+
+  logged_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.food_logs IS
+  'User food diary. Macro values are snapshotted at log time — editing a food does not change historical logs.';
+
+-- ============================================================
+-- WEIGHT_LOGS
+-- One or more weight entries per day.
+-- Multiple per day are allowed; trend calculations use
+-- the daily average.
+-- ============================================================
+
+CREATE TABLE public.weight_logs (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id          UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+
+  log_date         DATE NOT NULL,
+  weight_kg        NUMERIC(5,2) NOT NULL CHECK (weight_kg > 0 AND weight_kg < 1000),
+  body_fat_pct     NUMERIC(4,1) CHECK (body_fat_pct >= 0 AND body_fat_pct <= 100),
+  notes            TEXT,
+  source           TEXT DEFAULT 'manual' CHECK (source IN ('manual', 'apple_health', 'google_fit')),
+
+  logged_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.weight_logs IS
+  'Multiple entries per day are permitted. Calculations use daily average of weight_kg.';
+
+-- ============================================================
+-- GOALS
+-- User goals. Only one should be active at a time.
+-- Soft end via is_active flag; end_date is informational.
+-- ============================================================
+
+CREATE TABLE public.goals (
+  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id              UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+
+  goal_type            TEXT NOT NULL CHECK (goal_type IN ('cut', 'maintain', 'gain')),
+  target_weight_kg     NUMERIC(5,2) CHECK (target_weight_kg > 0),
+  weekly_rate_kg       NUMERIC(4,2),              -- signed: negative = cut, positive = gain
+
+  -- Derived calorie target (computed by GoalService, stored here for display)
+  calorie_target       NUMERIC(7,2),
+  protein_target_g     NUMERIC(7,2),
+  carbs_target_g       NUMERIC(7,2),
+  fat_target_g         NUMERIC(7,2),
+
+  -- Link to the TDEE estimate this goal was based on
+  based_on_tdee        NUMERIC(7,2),
+
+  is_active            BOOLEAN NOT NULL DEFAULT TRUE,
+  start_date           DATE NOT NULL,
+  end_date             DATE,
+
+  notes                TEXT,
+
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE public.goals IS
+  'One active goal at a time enforced by application logic, not DB constraint, to allow atomic transitions.';
+
+-- ============================================================
+-- EXPENDITURE_HISTORY
+-- Weekly TDEE estimates computed by ExpenditureService.
+-- Written once per week after check-in or background compute.
+-- ============================================================
+
+CREATE TABLE public.expenditure_history (
+  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id              UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+
+  week_start           DATE NOT NULL,            -- always a Monday
+  estimated_tdee       NUMERIC(7,2) NOT NULL,
+
+  -- Input data snapshot for audit
+  avg_intake_kcal      NUMERIC(7,2),
+  avg_weight_kg        NUMERIC(6,2),
+  weight_delta_kg      NUMERIC(5,3),             -- kg change over the week
+  days_with_logs       INT,                       -- how many days had food logs
+  computation_method   TEXT DEFAULT 'adaptive',   -- 'adaptive' or 'harris_benedict'
+
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE (user_id, week_start)
+);
+
+-- ============================================================
+-- WEEKLY_CHECKINS
+-- One check-in per week. Stores recommendation output.
+-- ============================================================
+
+CREATE TABLE public.weekly_checkins (
+  id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id               UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+
+  week_start            DATE NOT NULL,           -- Monday of the check-in week
+
+  -- Summary of the week
+  days_logged           INT,                     -- days with at least one food log entry
+  avg_calories_kcal     NUMERIC(7,2),
+  adherence_score       NUMERIC(4,2),            -- 0.0–1.0
+
+  -- Recommendation output
+  adjusted_calories     NUMERIC(7,2),
+  adjusted_protein_g    NUMERIC(7,2),
+
+  -- Reference to TDEE used for this check-in
+  tdee_used             NUMERIC(7,2),
+
+  notes                 TEXT,
+  completed_at          TIMESTAMPTZ,
+
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE (user_id, week_start)
+);
+
+-- ============================================================
+-- FAVORITES
+-- User-bookmarked foods for quick access.
+-- ============================================================
+
+CREATE TABLE public.favorites (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id          UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  food_id          UUID NOT NULL REFERENCES public.foods(id) ON DELETE CASCADE,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE (user_id, food_id)
+);
+
+-- ============================================================
+-- RECENT_FOODS
+-- Tracks the last time a user logged each food.
+-- Upserted on every log: update last_used_at and increment use_count.
+-- ============================================================
+
+CREATE TABLE public.recent_foods (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id          UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  food_id          UUID NOT NULL REFERENCES public.foods(id) ON DELETE CASCADE,
+  last_used_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  use_count        INT NOT NULL DEFAULT 1,
+
+  UNIQUE (user_id, food_id)
+);
+
+-- ============================================================
+-- AUTH TRIGGER: create profile on sign-up
+-- ============================================================
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION handle_new_user();
+```
+
+---
+
+## 4. Migration 003 — Indexes
+
+```sql
+-- supabase/migrations/20240101000003_indexes.sql
+
+-- ============================================================
+-- FOOD_LOGS — most frequently queried table
+-- ============================================================
+
+-- Primary query: all logs for a user on a given date
+CREATE INDEX idx_food_logs_user_date
+  ON public.food_logs (user_id, log_date DESC);
+
+-- Analytics range queries: all logs between two dates
+CREATE INDEX idx_food_logs_user_date_range
+  ON public.food_logs (user_id, log_date);
+
+-- ============================================================
+-- WEIGHT_LOGS
+-- ============================================================
+
+-- Most common: fetch weight history for trend calculation
+CREATE INDEX idx_weight_logs_user_date
+  ON public.weight_logs (user_id, log_date DESC);
+
+-- ============================================================
+-- FOODS — search is the critical path
+-- ============================================================
+
+-- Full-text search on name and brand
+CREATE INDEX idx_foods_fts
+  ON public.foods
+  USING GIN (to_tsvector('english', name || ' ' || COALESCE(brand, '')));
+
+-- Trigram index for fuzzy/partial match search
+CREATE INDEX idx_foods_name_trgm
+  ON public.foods
+  USING GIN (name gin_trgm_ops);
+
+-- User's custom foods
+CREATE INDEX idx_foods_user_id
+  ON public.foods (user_id)
+  WHERE user_id IS NOT NULL;
+
+-- ============================================================
+-- RECENT_FOODS
+-- ============================================================
+
+-- Ordered by recency for "recently used" list
+CREATE INDEX idx_recent_foods_user_recent
+  ON public.recent_foods (user_id, last_used_at DESC);
+
+-- ============================================================
+-- EXPENDITURE & CHECK-INS
+-- ============================================================
+
+CREATE INDEX idx_expenditure_user_week
+  ON public.expenditure_history (user_id, week_start DESC);
+
+CREATE INDEX idx_checkins_user_week
+  ON public.weekly_checkins (user_id, week_start DESC);
+
+-- ============================================================
+-- GOALS
+-- ============================================================
+
+-- Fetch active goal quickly
+CREATE INDEX idx_goals_user_active
+  ON public.goals (user_id, is_active, start_date DESC);
+```
+
+---
+
+## 5. Migration 004 — Row Level Security
+
+```sql
+-- supabase/migrations/20240101000004_rls.sql
+
+-- ============================================================
+-- DESIGN PRINCIPLE
+-- Every table has RLS enabled. All policies are based on
+-- auth.uid(). Users can only see and modify their own data.
+-- Global foods (user_id IS NULL) are readable by all users.
+-- ============================================================
+
+-- ============================================================
+-- PROFILES
+-- ============================================================
+
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "profiles: users can read own profile"
+  ON public.profiles FOR SELECT
+  USING (id = auth.uid());
+
+CREATE POLICY "profiles: users can update own profile"
+  ON public.profiles FOR UPDATE
+  USING (id = auth.uid())
+  WITH CHECK (id = auth.uid());
+
+-- INSERT is handled by handle_new_user() trigger (SECURITY DEFINER)
+-- No direct INSERT policy needed for client.
+
+-- ============================================================
+-- FOODS
+-- ============================================================
+
+ALTER TABLE public.foods ENABLE ROW LEVEL SECURITY;
+
+-- Global foods (user_id IS NULL) visible to all authenticated users.
+-- Custom foods (user_id IS NOT NULL) visible only to owner.
+CREATE POLICY "foods: read global and own"
+  ON public.foods FOR SELECT
+  USING (user_id IS NULL OR user_id = auth.uid());
+
+CREATE POLICY "foods: insert own custom foods only"
+  ON public.foods FOR INSERT
+  WITH CHECK (user_id = auth.uid());
+
+CREATE POLICY "foods: update own custom foods only"
+  ON public.foods FOR UPDATE
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
+
+CREATE POLICY "foods: delete own custom foods only"
+  ON public.foods FOR DELETE
+  USING (user_id = auth.uid());
+
+-- ============================================================
+-- FOOD_SERVING_ALTERNATIVES
+-- Visible if the parent food is visible (global or own).
+-- ============================================================
+
+ALTER TABLE public.food_serving_alternatives ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "serving_alternatives: read if food is visible"
+  ON public.food_serving_alternatives FOR SELECT
+  USING (
+    EXISTS (
+      SELECT 1 FROM public.foods f
+      WHERE f.id = food_id
+        AND (f.user_id IS NULL OR f.user_id = auth.uid())
+    )
+  );
+
+CREATE POLICY "serving_alternatives: insert for own foods"
+  ON public.food_serving_alternatives FOR INSERT
+  WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM public.foods f
+      WHERE f.id = food_id AND f.user_id = auth.uid()
+    )
+  );
+
+CREATE POLICY "serving_alternatives: delete for own foods"
+  ON public.food_serving_alternatives FOR DELETE
+  USING (
+    EXISTS (
+      SELECT 1 FROM public.foods f
+      WHERE f.id = food_id AND f.user_id = auth.uid()
+    )
+  );
+
+-- ============================================================
+-- FOOD_LOGS
+-- ============================================================
+
+ALTER TABLE public.food_logs ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "food_logs: full access to own rows"
+  ON public.food_logs FOR ALL
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
+
+-- ============================================================
+-- WEIGHT_LOGS
+-- ============================================================
+
+ALTER TABLE public.weight_logs ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "weight_logs: full access to own rows"
+  ON public.weight_logs FOR ALL
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
+
+-- ============================================================
+-- GOALS
+-- ============================================================
+
+ALTER TABLE public.goals ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "goals: full access to own rows"
+  ON public.goals FOR ALL
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
+
+-- ============================================================
+-- EXPENDITURE_HISTORY
+-- ============================================================
+
+ALTER TABLE public.expenditure_history ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "expenditure_history: full access to own rows"
+  ON public.expenditure_history FOR ALL
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
+
+-- ============================================================
+-- WEEKLY_CHECKINS
+-- ============================================================
+
+ALTER TABLE public.weekly_checkins ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "weekly_checkins: full access to own rows"
+  ON public.weekly_checkins FOR ALL
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
+
+-- ============================================================
+-- FAVORITES
+-- ============================================================
+
+ALTER TABLE public.favorites ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "favorites: full access to own rows"
+  ON public.favorites FOR ALL
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
+
+-- ============================================================
+-- RECENT_FOODS
+-- ============================================================
+
+ALTER TABLE public.recent_foods ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "recent_foods: full access to own rows"
+  ON public.recent_foods FOR ALL
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
+```
+
+---
+
+## 6. Migration 005 — Triggers & Automation
+
+```sql
+-- supabase/migrations/20240101000005_triggers.sql
+
+-- ============================================================
+-- updated_at triggers — applied to every mutable table
+-- ============================================================
+
+CREATE TRIGGER set_updated_at_profiles
+  BEFORE UPDATE ON public.profiles
+  FOR EACH ROW EXECUTE FUNCTION trigger_set_updated_at();
+
+CREATE TRIGGER set_updated_at_foods
+  BEFORE UPDATE ON public.foods
+  FOR EACH ROW EXECUTE FUNCTION trigger_set_updated_at();
+
+CREATE TRIGGER set_updated_at_food_logs
+  BEFORE UPDATE ON public.food_logs
+  FOR EACH ROW EXECUTE FUNCTION trigger_set_updated_at();
+
+CREATE TRIGGER set_updated_at_weight_logs
+  BEFORE UPDATE ON public.weight_logs
+  FOR EACH ROW EXECUTE FUNCTION trigger_set_updated_at();
+
+CREATE TRIGGER set_updated_at_goals
+  BEFORE UPDATE ON public.goals
+  FOR EACH ROW EXECUTE FUNCTION trigger_set_updated_at();
+
+-- ============================================================
+-- RECENT_FOODS upsert trigger
+-- When a food_log row is inserted, upsert into recent_foods:
+-- update last_used_at and increment use_count.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION handle_food_log_inserted()
+RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO public.recent_foods (user_id, food_id, last_used_at, use_count)
+  VALUES (NEW.user_id, NEW.food_id, NOW(), 1)
+  ON CONFLICT (user_id, food_id)
+  DO UPDATE SET
+    last_used_at = NOW(),
+    use_count = recent_foods.use_count + 1;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER on_food_log_inserted
+  AFTER INSERT ON public.food_logs
+  FOR EACH ROW EXECUTE FUNCTION handle_food_log_inserted();
+
+-- ============================================================
+-- GOAL ACTIVE GUARD
+-- When a goal is set to is_active = true, deactivate all
+-- other goals for that user. Prevents multiple active goals.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION handle_goal_activated()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.is_active = TRUE AND (OLD.is_active = FALSE OR OLD IS NULL) THEN
+    UPDATE public.goals
+    SET is_active = FALSE
+    WHERE user_id = NEW.user_id
+      AND id != NEW.id
+      AND is_active = TRUE;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER on_goal_activated
+  BEFORE INSERT OR UPDATE ON public.goals
+  FOR EACH ROW EXECUTE FUNCTION handle_goal_activated();
+```
+
+---
+
+## 7. Migration 006 — RPC Functions
+
+All analytics queries that aggregate data are implemented as PostgreSQL functions and called via `supabase.rpc()`. This avoids pulling raw rows to the client and summing in Dart.
+
+All functions are `SECURITY DEFINER` with `STABLE` or `VOLATILE` markers. They read `auth.uid()` internally so callers cannot pass a different user ID — RLS equivalent at the function level.
+
+```sql
+-- supabase/migrations/20240101000006_rpc_functions.sql
+
+-- ============================================================
+-- get_daily_nutrition_totals
+-- Returns summed macros for each day in a date range.
+-- Used by: CaloriesChart, MacrosChart, DailyLog aggregation.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION get_daily_nutrition_totals(
+  p_from DATE,
+  p_to   DATE
+)
+RETURNS TABLE (
+  log_date      DATE,
+  total_kcal    NUMERIC,
+  total_protein NUMERIC,
+  total_carbs   NUMERIC,
+  total_fat     NUMERIC,
+  entry_count   INT
+)
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+AS $$
+  SELECT
+    fl.log_date,
+    ROUND(SUM(fl.calories_kcal), 1)  AS total_kcal,
+    ROUND(SUM(fl.protein_g), 1)       AS total_protein,
+    ROUND(SUM(fl.carbs_g), 1)         AS total_carbs,
+    ROUND(SUM(fl.fat_g), 1)           AS total_fat,
+    COUNT(*)::INT                      AS entry_count
+  FROM public.food_logs fl
+  WHERE fl.user_id = auth.uid()
+    AND fl.log_date >= p_from
+    AND fl.log_date <= p_to
+  GROUP BY fl.log_date
+  ORDER BY fl.log_date;
+$$;
+
+COMMENT ON FUNCTION get_daily_nutrition_totals IS
+  'Aggregated daily nutrition for the authenticated user over a date range. Called for analytics charts.';
+
+-- ============================================================
+-- get_daily_nutrition_by_meal
+-- Breakdown of macros per meal_type per day.
+-- Used by: DetailedFoodLog screen, meal-level analytics.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION get_daily_nutrition_by_meal(
+  p_date DATE
+)
+RETURNS TABLE (
+  meal_type     TEXT,
+  total_kcal    NUMERIC,
+  total_protein NUMERIC,
+  total_carbs   NUMERIC,
+  total_fat     NUMERIC,
+  entry_count   INT
+)
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+AS $$
+  SELECT
+    fl.meal_type,
+    ROUND(SUM(fl.calories_kcal), 1),
+    ROUND(SUM(fl.protein_g), 1),
+    ROUND(SUM(fl.carbs_g), 1),
+    ROUND(SUM(fl.fat_g), 1),
+    COUNT(*)::INT
+  FROM public.food_logs fl
+  WHERE fl.user_id = auth.uid()
+    AND fl.log_date = p_date
+  GROUP BY fl.meal_type
+  ORDER BY
+    CASE fl.meal_type
+      WHEN 'breakfast' THEN 1
+      WHEN 'lunch'     THEN 2
+      WHEN 'dinner'    THEN 3
+      WHEN 'snack'     THEN 4
+    END;
+$$;
+
+-- ============================================================
+-- get_weight_log_window
+-- Returns all weight entries in a date range with the
+-- daily average pre-computed. Trend calculation uses the
+-- daily average, not raw entries.
+-- Used by: WeightTrendService (Dart), WeightChart.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION get_weight_log_window(
+  p_from DATE,
+  p_to   DATE
+)
+RETURNS TABLE (
+  log_date       DATE,
+  avg_weight_kg  NUMERIC,
+  min_weight_kg  NUMERIC,
+  max_weight_kg  NUMERIC,
+  entry_count    INT
+)
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+AS $$
+  SELECT
+    wl.log_date,
+    ROUND(AVG(wl.weight_kg), 2)  AS avg_weight_kg,
+    ROUND(MIN(wl.weight_kg), 2)  AS min_weight_kg,
+    ROUND(MAX(wl.weight_kg), 2)  AS max_weight_kg,
+    COUNT(*)::INT                 AS entry_count
+  FROM public.weight_logs wl
+  WHERE wl.user_id = auth.uid()
+    AND wl.log_date >= p_from
+    AND wl.log_date <= p_to
+  GROUP BY wl.log_date
+  ORDER BY wl.log_date;
+$$;
+
+COMMENT ON FUNCTION get_weight_log_window IS
+  'Returns daily average weight for each day in range. WeightTrendService uses avg_weight_kg for EWMA.';
+
+-- ============================================================
+-- get_weekly_expenditure_inputs
+-- Returns per-week aggregates needed by ExpenditureService:
+-- average intake, average weight, and weight change.
+-- Used by: ExpenditureService (Dart side does final calc).
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION get_weekly_expenditure_inputs(
+  p_from DATE,  -- start of oldest week (Monday)
+  p_to   DATE   -- end of most recent week (Sunday)
+)
+RETURNS TABLE (
+  week_start         DATE,
+  avg_intake_kcal    NUMERIC,
+  days_with_logs     INT,
+  avg_weight_kg      NUMERIC,
+  start_weight_kg    NUMERIC,
+  end_weight_kg      NUMERIC
+)
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+AS $$
+  WITH weekly_intake AS (
+    SELECT
+      date_trunc('week', fl.log_date)::DATE AS week_start,
+      ROUND(AVG(daily_totals.day_kcal), 1)  AS avg_intake_kcal,
+      COUNT(DISTINCT fl.log_date)::INT       AS days_with_logs
+    FROM public.food_logs fl
+    JOIN (
+      SELECT log_date, SUM(calories_kcal) AS day_kcal
+      FROM public.food_logs
+      WHERE user_id = auth.uid()
+      GROUP BY log_date
+    ) daily_totals ON daily_totals.log_date = fl.log_date
+    WHERE fl.user_id = auth.uid()
+      AND fl.log_date >= p_from
+      AND fl.log_date <= p_to
+    GROUP BY week_start
+  ),
+  weekly_weight AS (
+    SELECT
+      date_trunc('week', wl.log_date)::DATE AS week_start,
+      ROUND(AVG(wl.weight_kg), 2)           AS avg_weight_kg,
+      FIRST_VALUE(wl.weight_kg) OVER (
+        PARTITION BY date_trunc('week', wl.log_date)
+        ORDER BY wl.log_date ASC
+      )                                      AS start_weight_kg,
+      LAST_VALUE(wl.weight_kg) OVER (
+        PARTITION BY date_trunc('week', wl.log_date)
+        ORDER BY wl.log_date ASC
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+      )                                      AS end_weight_kg
+    FROM public.weight_logs wl
+    WHERE wl.user_id = auth.uid()
+      AND wl.log_date >= p_from
+      AND wl.log_date <= p_to
+  )
+  SELECT
+    wi.week_start,
+    wi.avg_intake_kcal,
+    wi.days_with_logs,
+    ROUND(ww.avg_weight_kg, 2),
+    ROUND(ww.start_weight_kg, 2),
+    ROUND(ww.end_weight_kg, 2)
+  FROM weekly_intake wi
+  LEFT JOIN weekly_weight ww ON ww.week_start = wi.week_start
+  ORDER BY wi.week_start;
+$$;
+
+-- ============================================================
+-- search_foods
+-- Hybrid search: full-text + trigram similarity.
+-- Returns user's custom foods first, then global foods.
+-- Used by: FoodSearchService, FoodSearchScreen.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION search_foods(
+  p_query TEXT,
+  p_limit INT DEFAULT 25
+)
+RETURNS TABLE (
+  id             UUID,
+  user_id        UUID,
+  name           TEXT,
+  brand          TEXT,
+  serving_size_g NUMERIC,
+  serving_label  TEXT,
+  calories_kcal  NUMERIC,
+  protein_g      NUMERIC,
+  carbs_g        NUMERIC,
+  fat_g          NUMERIC,
+  is_verified    BOOLEAN,
+  is_custom      BOOLEAN,
+  rank           REAL
+)
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+AS $$
+  SELECT
+    f.id,
+    f.user_id,
+    f.name,
+    f.brand,
+    f.serving_size_g,
+    f.serving_label,
+    f.calories_kcal,
+    f.protein_g,
+    f.carbs_g,
+    f.fat_g,
+    f.is_verified,
+    (f.user_id = auth.uid()) AS is_custom,
+    (
+      ts_rank(
+        to_tsvector('english', f.name || ' ' || COALESCE(f.brand, '')),
+        plainto_tsquery('english', p_query)
+      )
+      + similarity(f.name, p_query) * 0.3
+      -- Boost user's own foods
+      + CASE WHEN f.user_id = auth.uid() THEN 0.5 ELSE 0 END
+      -- Boost verified global foods
+      + CASE WHEN f.is_verified THEN 0.2 ELSE 0 END
+    ) AS rank
+  FROM public.foods f
+  WHERE
+    (f.user_id IS NULL OR f.user_id = auth.uid())
+    AND (
+      to_tsvector('english', f.name || ' ' || COALESCE(f.brand, ''))
+        @@ plainto_tsquery('english', p_query)
+      OR similarity(f.name, p_query) > 0.15
+      OR f.name ILIKE '%' || p_query || '%'
+    )
+  ORDER BY rank DESC
+  LIMIT p_limit;
+$$;
+
+COMMENT ON FUNCTION search_foods IS
+  'Hybrid FTS + trigram search. User custom foods ranked first, then verified global foods.';
+
+-- ============================================================
+-- get_recent_foods_with_details
+-- Returns recent foods with full food data joined.
+-- Used by: RecentFoodsList widget.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION get_recent_foods_with_details(
+  p_limit INT DEFAULT 20
+)
+RETURNS TABLE (
+  food_id        UUID,
+  name           TEXT,
+  brand          TEXT,
+  serving_size_g NUMERIC,
+  serving_label  TEXT,
+  calories_kcal  NUMERIC,
+  protein_g      NUMERIC,
+  carbs_g        NUMERIC,
+  fat_g          NUMERIC,
+  last_used_at   TIMESTAMPTZ,
+  use_count      INT
+)
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+AS $$
+  SELECT
+    f.id,
+    f.name,
+    f.brand,
+    f.serving_size_g,
+    f.serving_label,
+    f.calories_kcal,
+    f.protein_g,
+    f.carbs_g,
+    f.fat_g,
+    rf.last_used_at,
+    rf.use_count
+  FROM public.recent_foods rf
+  JOIN public.foods f ON f.id = rf.food_id
+  WHERE rf.user_id = auth.uid()
+  ORDER BY rf.last_used_at DESC
+  LIMIT p_limit;
+$$;
+
+-- ============================================================
+-- get_favorite_foods_with_details
+-- Returns all favourited foods with full food data joined.
+-- Used by: FavoriteFoodsList widget.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION get_favorite_foods_with_details()
+RETURNS TABLE (
+  food_id        UUID,
+  name           TEXT,
+  brand          TEXT,
+  serving_size_g NUMERIC,
+  serving_label  TEXT,
+  calories_kcal  NUMERIC,
+  protein_g      NUMERIC,
+  carbs_g        NUMERIC,
+  fat_g          NUMERIC,
+  favorited_at   TIMESTAMPTZ
+)
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+AS $$
+  SELECT
+    f.id,
+    f.name,
+    f.brand,
+    f.serving_size_g,
+    f.serving_label,
+    f.calories_kcal,
+    f.protein_g,
+    f.carbs_g,
+    f.fat_g,
+    fav.created_at
+  FROM public.favorites fav
+  JOIN public.foods f ON f.id = fav.food_id
+  WHERE fav.user_id = auth.uid()
+  ORDER BY fav.created_at DESC;
+$$;
+
+-- ============================================================
+-- upsert_recent_food
+-- Called explicitly by the client when a food is logged.
+-- The trigger on food_logs also calls this, but the function
+-- is exposed for future use (e.g., viewing a food detail page).
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION upsert_recent_food(p_food_id UUID)
+RETURNS VOID
+LANGUAGE SQL
+VOLATILE
+SECURITY DEFINER
+AS $$
+  INSERT INTO public.recent_foods (user_id, food_id, last_used_at, use_count)
+  VALUES (auth.uid(), p_food_id, NOW(), 1)
+  ON CONFLICT (user_id, food_id)
+  DO UPDATE SET
+    last_used_at = NOW(),
+    use_count = recent_foods.use_count + 1;
+$$;
+
+-- ============================================================
+-- toggle_favorite
+-- Adds or removes a food from favourites.
+-- Returns TRUE if food is now a favourite, FALSE if removed.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION toggle_favorite(p_food_id UUID)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_exists BOOLEAN;
+BEGIN
+  SELECT EXISTS (
+    SELECT 1 FROM public.favorites
+    WHERE user_id = auth.uid() AND food_id = p_food_id
+  ) INTO v_exists;
+
+  IF v_exists THEN
+    DELETE FROM public.favorites
+    WHERE user_id = auth.uid() AND food_id = p_food_id;
+    RETURN FALSE;
+  ELSE
+    INSERT INTO public.favorites (user_id, food_id)
+    VALUES (auth.uid(), p_food_id);
+    RETURN TRUE;
+  END IF;
+END;
+$$;
+
+-- ============================================================
+-- get_dashboard_summary
+-- Single RPC for the dashboard screen. Returns daily totals
+-- plus goal targets in one round trip.
+-- Used by: DashboardScreen on mount.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION get_dashboard_summary(p_date DATE)
+RETURNS JSON
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_result JSON;
+BEGIN
+  SELECT json_build_object(
+    'date', p_date,
+    'nutrition', (
+      SELECT json_build_object(
+        'total_kcal',    ROUND(COALESCE(SUM(calories_kcal), 0), 1),
+        'total_protein', ROUND(COALESCE(SUM(protein_g), 0), 1),
+        'total_carbs',   ROUND(COALESCE(SUM(carbs_g), 0), 1),
+        'total_fat',     ROUND(COALESCE(SUM(fat_g), 0), 1),
+        'entry_count',   COUNT(*)
+      )
+      FROM public.food_logs
+      WHERE user_id = auth.uid() AND log_date = p_date
+    ),
+    'weight_today', (
+      SELECT json_build_object(
+        'avg_kg', ROUND(AVG(weight_kg), 2),
+        'count',  COUNT(*)
+      )
+      FROM public.weight_logs
+      WHERE user_id = auth.uid() AND log_date = p_date
+    ),
+    'active_goal', (
+      SELECT row_to_json(g)
+      FROM (
+        SELECT id, goal_type, calorie_target, protein_target_g,
+               carbs_target_g, fat_target_g, target_weight_kg, weekly_rate_kg
+        FROM public.goals
+        WHERE user_id = auth.uid() AND is_active = TRUE
+        LIMIT 1
+      ) g
+    )
+  ) INTO v_result;
+
+  RETURN v_result;
+END;
+$$;
+
+COMMENT ON FUNCTION get_dashboard_summary IS
+  'Single round-trip RPC for dashboard: daily nutrition totals + todays weight + active goal targets.';
+
+-- ============================================================
+-- get_logging_streak
+-- Returns current consecutive days logged (ending today or yesterday).
+-- Used by: DashboardScreen streak display.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION get_logging_streak()
+RETURNS INT
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_streak   INT := 0;
+  v_check    DATE := CURRENT_DATE;
+  v_has_log  BOOLEAN;
+BEGIN
+  -- Check today first; if no log today, start from yesterday
+  SELECT EXISTS (
+    SELECT 1 FROM public.food_logs
+    WHERE user_id = auth.uid() AND log_date = v_check
+  ) INTO v_has_log;
+
+  IF NOT v_has_log THEN
+    v_check := v_check - 1;
+  END IF;
+
+  -- Walk backwards until a day with no log
+  LOOP
+    SELECT EXISTS (
+      SELECT 1 FROM public.food_logs
+      WHERE user_id = auth.uid() AND log_date = v_check
+    ) INTO v_has_log;
+
+    EXIT WHEN NOT v_has_log;
+
+    v_streak := v_streak + 1;
+    v_check  := v_check - 1;
+  END LOOP;
+
+  RETURN v_streak;
+END;
+$$;
+
+-- ============================================================
+-- get_check_in_data
+-- Returns all inputs needed by CheckInService:
+-- last week's daily calories and weight entries.
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION get_check_in_data(p_week_start DATE)
+RETURNS JSON
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_week_end DATE := p_week_start + 6;
+BEGIN
+  RETURN json_build_object(
+    'week_start', p_week_start,
+    'week_end',   v_week_end,
+    'daily_calories', (
+      SELECT json_agg(row_to_json(t))
+      FROM (
+        SELECT log_date, ROUND(SUM(calories_kcal), 1) AS total_kcal
+        FROM public.food_logs
+        WHERE user_id = auth.uid()
+          AND log_date >= p_week_start
+          AND log_date <= v_week_end
+        GROUP BY log_date
+        ORDER BY log_date
+      ) t
+    ),
+    'daily_weights', (
+      SELECT json_agg(row_to_json(t))
+      FROM (
+        SELECT log_date, ROUND(AVG(weight_kg), 2) AS avg_weight_kg
+        FROM public.weight_logs
+        WHERE user_id = auth.uid()
+          AND log_date >= p_week_start
+          AND log_date <= v_week_end
+        GROUP BY log_date
+        ORDER BY log_date
+      ) t
+    ),
+    'active_goal', (
+      SELECT row_to_json(g)
+      FROM (
+        SELECT calorie_target, protein_target_g, goal_type, weekly_rate_kg
+        FROM public.goals
+        WHERE user_id = auth.uid() AND is_active = TRUE
+        LIMIT 1
+      ) g
+    )
+  );
+END;
+$$;
+```
+
+---
+
+## 8. Migration 007 — Seed Data
+
+This migration populates the `foods` table with a starter set of common foods. All seed foods have `user_id = NULL` (global), `is_verified = TRUE`, `source = 'admin'`.
+
+Nutritional values are per the declared `serving_size_g` and `serving_label`.
+
+```sql
+-- supabase/migrations/20240101000007_seed_data.sql
+-- All values: calories (kcal), protein/carbs/fat (g) per serving
+
+INSERT INTO public.foods
+  (name, brand, serving_size_g, serving_label, calories_kcal, protein_g, carbs_g, fat_g, fiber_g, is_verified, source)
+VALUES
+
+-- ============================================================
+-- PROTEIN SOURCES
+-- ============================================================
+
+('Chicken breast, cooked', NULL,              100, '100g',         165, 31.0,  0.0,  3.6, 0.0, TRUE, 'admin'),
+('Chicken thigh, cooked',  NULL,              100, '100g',         209, 26.0,  0.0, 10.9, 0.0, TRUE, 'admin'),
+('Salmon, cooked',         NULL,              100, '100g',         208, 20.4,  0.0, 13.4, 0.0, TRUE, 'admin'),
+('Tuna, canned in water',  NULL,              100, '100g',         109, 25.5,  0.0,  0.8, 0.0, TRUE, 'admin'),
+('Eggs, whole, large',     NULL,               50, '1 large egg',   78,  6.3,  0.6,  5.3, 0.0, TRUE, 'admin'),
+('Egg whites',             NULL,               33, '1 egg white',   17,  3.6,  0.2,  0.1, 0.0, TRUE, 'admin'),
+('Greek yogurt, plain 0%', NULL,              170, '170g container',100, 17.0, 6.0,  0.0, 0.0, TRUE, 'admin'),
+('Cottage cheese, low-fat',NULL,              113, '½ cup',         81, 14.0,  3.0,  1.0, 0.0, TRUE, 'admin'),
+('Ground beef, 95% lean',  NULL,              100, '100g',         152, 24.2,  0.0,  5.6, 0.0, TRUE, 'admin'),
+('Ground beef, 80% lean',  NULL,              100, '100g',         254, 17.2,  0.0, 20.0, 0.0, TRUE, 'admin'),
+('Turkey breast, cooked',  NULL,              100, '100g',         135, 30.1,  0.0,  1.0, 0.0, TRUE, 'admin'),
+('Shrimp, cooked',         NULL,              100, '100g',          99, 24.0,  0.0,  0.3, 0.0, TRUE, 'admin'),
+('Tilapia, cooked',        NULL,              100, '100g',         128, 26.0,  0.0,  2.7, 0.0, TRUE, 'admin'),
+('Beef steak, sirloin',    NULL,              100, '100g',         207, 26.0,  0.0, 10.6, 0.0, TRUE, 'admin'),
+('Tofu, firm',             NULL,              100, '100g',          76,  8.1,  1.9,  4.8, 0.3, TRUE, 'admin'),
+('Tempeh',                 NULL,              100, '100g',         192, 19.9,  9.4, 10.8, 0.0, TRUE, 'admin'),
+('Edamame, shelled',       NULL,              155, '1 cup',        188, 18.4, 13.8,  8.1, 8.1, TRUE, 'admin'),
+
+-- ============================================================
+-- DAIRY & PROTEIN POWDERS
+-- ============================================================
+
+('Milk, whole',            NULL,              244, '1 cup (244ml)', 149,  8.0, 12.0,  8.0, 0.0, TRUE, 'admin'),
+('Milk, 2%',               NULL,              244, '1 cup (244ml)', 122,  8.1, 11.7,  4.8, 0.0, TRUE, 'admin'),
+('Milk, skim',             NULL,              244, '1 cup (244ml)',  83,  8.3, 12.2,  0.2, 0.0, TRUE, 'admin'),
+('Cheddar cheese',         NULL,               28, '1 oz (28g)',    113,  7.0,  0.4,  9.3, 0.0, TRUE, 'admin'),
+('Mozzarella, part-skim',  NULL,               28, '1 oz (28g)',     72,  6.9,  0.9,  4.5, 0.0, TRUE, 'admin'),
+('Whey protein powder',    NULL,               31, '1 scoop (~31g)',120, 25.0,  3.0,  1.5, 0.0, TRUE, 'admin'),
+
+-- ============================================================
+-- GRAINS & STARCHES
+-- ============================================================
+
+('White rice, cooked',     NULL,              186, '1 cup cooked',  242,  4.4, 53.2,  0.4, 0.6, TRUE, 'admin'),
+('Brown rice, cooked',     NULL,              195, '1 cup cooked',  216,  5.0, 44.8,  1.8, 3.5, TRUE, 'admin'),
+('Oats, dry rolled',       NULL,               40, '½ cup dry',     152,  5.3, 27.4,  2.6, 4.0, TRUE, 'admin'),
+('Pasta, cooked',          NULL,              140, '1 cup cooked',  220,  8.1, 43.2,  1.3, 2.5, TRUE, 'admin'),
+('Bread, whole wheat',     NULL,               32, '1 slice',        81,  4.0, 13.8,  1.1, 1.9, TRUE, 'admin'),
+('Bread, white',           NULL,               29, '1 slice',        75,  2.7, 14.3,  1.0, 0.7, TRUE, 'admin'),
+('Sweet potato, cooked',   NULL,              130, '1 medium',      112,  2.0, 26.0,  0.1, 3.8, TRUE, 'admin'),
+('White potato, boiled',   NULL,              150, '1 medium',      116,  2.5, 27.0,  0.1, 1.8, TRUE, 'admin'),
+('Quinoa, cooked',         NULL,              185, '1 cup cooked',  222,  8.1, 39.4,  3.6, 5.2, TRUE, 'admin'),
+('Tortilla, flour 10"',    NULL,               72, '1 tortilla',    227,  5.8, 36.6,  5.5, 2.2, TRUE, 'admin'),
+('Tortilla, corn 6"',      NULL,               26, '1 tortilla',     58,  1.5, 12.1,  0.7, 1.4, TRUE, 'admin'),
+
+-- ============================================================
+-- LEGUMES
+-- ============================================================
+
+('Black beans, cooked',    NULL,              172, '1 cup cooked',  227, 15.2, 40.8,  0.9, 15.0, TRUE, 'admin'),
+('Lentils, cooked',        NULL,              198, '1 cup cooked',  230, 17.9, 39.9,  0.8, 15.6, TRUE, 'admin'),
+('Chickpeas, cooked',      NULL,              164, '1 cup cooked',  269, 14.5, 44.9,  4.2, 12.5, TRUE, 'admin'),
+
+-- ============================================================
+-- VEGETABLES
+-- ============================================================
+
+('Broccoli, cooked',       NULL,              156, '1 cup',          55,  3.7, 11.2,  0.6, 5.1, TRUE, 'admin'),
+('Spinach, raw',           NULL,               30, '1 cup',           7,  0.9,  1.1,  0.1, 0.7, TRUE, 'admin'),
+('Bell pepper, red, raw',  NULL,              119, '1 medium',        37,  1.2,  7.2,  0.4, 2.5, TRUE, 'admin'),
+('Cucumber, raw',          NULL,              119, '1 medium',        18,  0.7,  4.3,  0.1, 0.6, TRUE, 'admin'),
+('Tomato, raw',            NULL,              123, '1 medium',        22,  1.1,  4.8,  0.2, 1.5, TRUE, 'admin'),
+('Lettuce, romaine',       NULL,               47, '1 cup shredded',   8,  0.6,  1.5,  0.1, 1.0, TRUE, 'admin'),
+('Carrot, raw',            NULL,               61, '1 medium',        25,  0.6,  5.8,  0.1, 1.7, TRUE, 'admin'),
+('Zucchini, cooked',       NULL,              180, '1 cup',           27,  2.0,  5.1,  0.3, 1.8, TRUE, 'admin'),
+('Asparagus, cooked',      NULL,              180, '1 cup',           40,  4.3,  7.4,  0.4, 3.6, TRUE, 'admin'),
+('Green beans, cooked',    NULL,              125, '1 cup',           44,  2.4, 9.9,   0.4, 4.0, TRUE, 'admin'),
+('Corn, cooked',           NULL,              154, '1 cup',          132,  5.0, 29.0,  1.8, 3.6, TRUE, 'admin'),
+
+-- ============================================================
+-- FRUITS
+-- ============================================================
+
+('Banana',                 NULL,              118, '1 medium',       105,  1.3, 27.0,  0.4, 3.1, TRUE, 'admin'),
+('Apple',                  NULL,              182, '1 medium',        95,  0.5, 25.1,  0.3, 4.4, TRUE, 'admin'),
+('Orange',                 NULL,              131, '1 medium',        62,  1.2, 15.4,  0.2, 3.1, TRUE, 'admin'),
+('Blueberries',            NULL,              148, '1 cup',           84,  1.1, 21.5,  0.5, 3.6, TRUE, 'admin'),
+('Strawberries',           NULL,              152, '1 cup',           49,  1.0, 11.7,  0.5, 3.0, TRUE, 'admin'),
+('Grapes',                 NULL,              151, '1 cup',          104,  1.1, 27.3,  0.2, 1.4, TRUE, 'admin'),
+('Avocado',                NULL,              201, '1 whole',        322,  4.0, 17.1, 29.5, 13.5, TRUE, 'admin'),
+
+-- ============================================================
+-- FATS & OILS
+-- ============================================================
+
+('Olive oil',              NULL,               14, '1 tbsp',         119,  0.0,  0.0, 13.5, 0.0, TRUE, 'admin'),
+('Butter',                 NULL,               14, '1 tbsp',         102,  0.1,  0.0, 11.5, 0.0, TRUE, 'admin'),
+('Coconut oil',            NULL,               14, '1 tbsp',         121,  0.0,  0.0, 13.5, 0.0, TRUE, 'admin'),
+('Peanut butter, natural', NULL,               32, '2 tbsp',         188,  8.0,  7.0, 16.0, 2.0, TRUE, 'admin'),
+('Almond butter',          NULL,               32, '2 tbsp',         196,  6.7,  6.1, 18.0, 3.3, TRUE, 'admin'),
+('Almonds',                NULL,               28, '1 oz (23 nuts)', 164,  6.0,  6.1, 14.2, 3.5, TRUE, 'admin'),
+('Walnuts',                NULL,               28, '1 oz',           185,  4.3,  3.9, 18.5, 1.9, TRUE, 'admin'),
+
+-- ============================================================
+-- SNACKS & COMMON PACKAGED
+-- ============================================================
+
+('Protein bar (generic)',  NULL,               60, '1 bar',          200, 20.0, 25.0,  7.0, 5.0, TRUE, 'admin'),
+('Rice cakes, plain',      NULL,                9, '1 cake',          35,  0.7,  7.3,  0.3, 0.4, TRUE, 'admin'),
+('Dark chocolate, 70%',    NULL,               40, '4 squares',      228,  2.8, 23.8, 14.4, 2.8, TRUE, 'admin'),
+
+-- ============================================================
+-- BEVERAGES
+-- ============================================================
+
+('Coffee, black',          NULL,              240, '1 cup (240ml)',    2,  0.3,  0.0,  0.0, 0.0, TRUE, 'admin'),
+('Orange juice',           NULL,              240, '1 cup (240ml)',  112,  1.7, 25.8,  0.5, 0.5, TRUE, 'admin'),
+('Protein shake, ready',   NULL,              414, '1 bottle',       160, 30.0, 10.0,  3.0, 1.0, TRUE, 'admin');
+```
+
+---
+
+## 9. Supabase Storage Setup
+
+No image storage is required for V1. The `profiles.avatar_url` column stores an external URL if the user has a profile image (e.g. from Google OAuth). No Supabase Storage bucket is needed yet.
+
+Reserve bucket creation for V2 if/when food images are added.
+
+---
+
+## 10. Auth Configuration
+
+### 10.1 Site URL & Redirect URLs
+
+In Supabase Dashboard → Authentication → URL Configuration:
+
+```
+Site URL:         nutratrack://auth/callback
+Redirect URLs:    nutratrack://auth/callback
+                  nutratrack://auth/reset-password
+```
+
+These deep link URIs must match the `flutter_applinks` / `go_router` redirect handling in the Flutter app.
+
+### 10.2 Email Templates (Optional)
+
+For personal use, default Supabase email templates are acceptable. Email confirmation is disabled.
+
+### 10.3 Password Policy
+
+Supabase default (minimum 6 characters). For a personal app this is sufficient.
+
+---
+
+## 11. Environment Variables
+
+### 11.1 Flutter (`lib/core/constants/supabase_constants.dart`)
+
+```dart
+// lib/core/constants/supabase_constants.dart
+
+abstract class SupabaseConstants {
+  // Loaded from --dart-define at build time.
+  // Never hardcode these values in source code.
+  static const supabaseUrl = String.fromEnvironment('SUPABASE_URL');
+  static const supabaseAnonKey = String.fromEnvironment('SUPABASE_ANON_KEY');
+
+  // Table names
+  static const tableProfiles            = 'profiles';
+  static const tableFoods               = 'foods';
+  static const tableFoodServings        = 'food_serving_alternatives';
+  static const tableFoodLogs            = 'food_logs';
+  static const tableWeightLogs          = 'weight_logs';
+  static const tableGoals               = 'goals';
+  static const tableExpenditureHistory  = 'expenditure_history';
+  static const tableWeeklyCheckins      = 'weekly_checkins';
+  static const tableFavorites           = 'favorites';
+  static const tableRecentFoods         = 'recent_foods';
+
+  // RPC function names
+  static const rpcGetDailyNutritionTotals    = 'get_daily_nutrition_totals';
+  static const rpcGetDailyNutritionByMeal    = 'get_daily_nutrition_by_meal';
+  static const rpcGetWeightLogWindow         = 'get_weight_log_window';
+  static const rpcGetWeeklyExpenditureInputs = 'get_weekly_expenditure_inputs';
+  static const rpcSearchFoods                = 'search_foods';
+  static const rpcGetRecentFoods             = 'get_recent_foods_with_details';
+  static const rpcGetFavoriteFoods           = 'get_favorite_foods_with_details';
+  static const rpcToggleFavorite             = 'toggle_favorite';
+  static const rpcGetDashboardSummary        = 'get_dashboard_summary';
+  static const rpcGetLoggingStreak           = 'get_logging_streak';
+  static const rpcGetCheckInData             = 'get_check_in_data';
+}
+```
+
+### 11.2 Build Commands
+
+```bash
+# Development
+flutter run \
+  --dart-define=SUPABASE_URL=https://yourproject.supabase.co \
+  --dart-define=SUPABASE_ANON_KEY=your_anon_key_here
+
+# Production build (iOS)
+flutter build ipa \
+  --dart-define=SUPABASE_URL=https://yourproject.supabase.co \
+  --dart-define=SUPABASE_ANON_KEY=your_anon_key_here
+
+# Production build (Android)
+flutter build appbundle \
+  --dart-define=SUPABASE_URL=https://yourproject.supabase.co \
+  --dart-define=SUPABASE_ANON_KEY=your_anon_key_here
+```
+
+Store secrets in a local `.env` file (git-ignored) and source them in build scripts. Do not use `flutter_dotenv` in production — `--dart-define` is the correct approach as values are compiled into the binary and not readable from the filesystem at runtime.
+
+### 11.3 `supabase/config.toml`
+
+```toml
+[api]
+port = 54321
+
+[db]
+port = 54322
+major_version = 15
+
+[studio]
+port = 54323
+
+[auth]
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["nutratrack://auth/callback"]
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = false
+enable_confirmations = false
+```
+
+---
+
+## 12. Database Design Decisions
+
+### 12.1 Why Snapshot Macros in `food_logs`
+
+If a user edits a custom food (corrects calories from 200 to 180 kcal), every historical log entry that references that food should not change retroactively. Snapshotting `calories_kcal`, `protein_g`, `carbs_g`, `fat_g`, `fat_g`, `fiber_g`, `sugar_g`, `sodium_mg` at log time means historical data is immutable and accurate to what was actually consumed.
+
+This is standard practice in every serious nutrition tracking application.
+
+### 12.2 Why `user_id IS NULL` for Global Foods
+
+Using a sentinel value (NULL) rather than a separate `admin_user_id` UUID keeps the RLS policies simple. The query `user_id IS NULL OR user_id = auth.uid()` cleanly covers both cases without any additional join or lookup.
+
+The alternative — a separate `global_foods` table — would require a UNION in every search query.
+
+### 12.3 Why Multiple Weight Entries Per Day
+
+The original V1 draft had a UNIQUE constraint on `(user_id, log_date)`. This is wrong. A user may weigh themselves morning and evening, or log a reading from a smart scale that syncs multiple times. The trend calculation uses `AVG(weight_kg)` per day via the `get_weight_log_window` RPC, so multiple entries are handled correctly.
+
+### 12.4 Why `date_trunc('week', ...)` Uses Monday
+
+PostgreSQL's `date_trunc('week', timestamp)` truncates to Monday (ISO week standard). All `week_start` values in `expenditure_history` and `weekly_checkins` will be Mondays. The Flutter app must use the same convention when constructing dates for RPC calls.
+
+```dart
+// Correct way to get the start of the current week in Dart
+DateTime startOfWeek(DateTime date) {
+  return date.subtract(Duration(days: date.weekday - 1));
+}
+// Monday = weekday 1. Subtracting (weekday - 1) days gives the Monday.
+```
+
+### 12.5 Why All RPC Functions Are SECURITY DEFINER
+
+`SECURITY DEFINER` means the function runs with the privileges of the function owner (typically `postgres`), not the calling user. This is required because:
+
+1. The function reads `auth.uid()` internally to scope results — the caller cannot pass a different user ID.
+2. Some functions (like `toggle_favorite`) bypass RLS for their internal operations while still being scoped to the calling user's data.
+3. It prevents any possibility of a client constructing a query that bypasses the user scoping.
+
+Every `SECURITY DEFINER` function in this codebase explicitly filters by `auth.uid()` — they are not less secure, they are more secure, because the scoping is non-bypassable.
+
+### 12.6 `get_dashboard_summary` Design
+
+This RPC returns a single JSON object combining nutrition totals, today's weight, and the active goal in one network round trip. The dashboard screen is the most-visited screen in the app. Making three separate Supabase calls from the client would produce three waterfall round trips on every navigation to the dashboard. One RPC eliminates this.
+
+The tradeoff: the RPC is less composable. If the dashboard layout changes significantly, the RPC may need updating. This is acceptable — RPC functions are cheap to update compared to the UX cost of a slow dashboard.
+
+---
+
+*Part 2 complete. Next: Part 3 — Flutter implementation starting with Phase 1 infrastructure.*
